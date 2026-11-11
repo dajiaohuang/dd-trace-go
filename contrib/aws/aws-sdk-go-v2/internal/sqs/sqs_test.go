@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
@@ -189,7 +190,7 @@ func TestInjectTraceContext(t *testing.T) {
 
 			traceContext, err := getTraceContext(spanCtx, span, "test-queue", 42)
 			assert.NoError(t, err)
-			injectTraceContext(traceContext, messageAttributes)
+			injectTraceContext(traceContext, messageAttributes, maxMessageBytes)
 
 			if tt.expectInjection {
 				assert.Contains(t, messageAttributes, datadogKey)
@@ -252,4 +253,46 @@ func BenchmarkEnrichOperation(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestMessageSizeLimit(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+	span, ctx := tracer.StartSpanFromContext(context.Background(), "produce")
+	defer span.Finish()
+	enricher := NewEnricher(true)
+	const limit = 1 << 20
+
+	t.Run("single message", func(t *testing.T) {
+		params := &sqs.SendMessageInput{MessageBody: aws.String(strings.Repeat("a", limit))}
+		enricher.EnrichOperation(ctx, span, middleware.InitializeInput{Parameters: params}, "SendMessage")
+		require.NotContains(t, params.MessageAttributes, datadogKey)
+	})
+
+	t.Run("existing trace attribute at the size limit", func(t *testing.T) {
+		old := strings.Repeat("x", 4096)
+		params := &sqs.SendMessageInput{
+			MessageAttributes: map[string]types.MessageAttributeValue{datadogKey: {DataType: aws.String("String"), StringValue: aws.String(old)}},
+			MessageBody:       aws.String(strings.Repeat("a", limit-len(datadogKey)-len("String")-len(old))),
+		}
+		enricher.EnrichOperation(ctx, span, middleware.InitializeInput{Parameters: params}, "SendMessage")
+		require.NotEqual(t, old, aws.ToString(params.MessageAttributes[datadogKey].StringValue))
+		require.LessOrEqual(t, sendMessageSize(params), int64(limit))
+	})
+
+	t.Run("batch shares the message size budget", func(t *testing.T) {
+		small := &sqs.SendMessageInput{MessageBody: aws.String("a")}
+		enricher.EnrichOperation(ctx, span, middleware.InitializeInput{Parameters: small}, "SendMessage")
+		require.Contains(t, small.MessageAttributes, datadogKey)
+		overhead := messageAttributesSize(small.MessageAttributes)
+		shared := map[string]types.MessageAttributeValue{"format": {DataType: aws.String("Binary.custom"), BinaryValue: []byte{0, 1}}}
+		const sharedSize = len("format") + len("Binary.custom") + 2
+		params := &sqs.SendMessageBatchInput{Entries: []types.SendMessageBatchRequestEntry{
+			{MessageBody: aws.String("a"), MessageAttributes: shared},
+			{MessageBody: aws.String(strings.Repeat("b", limit-1-int(overhead)-2*sharedSize)), MessageAttributes: shared},
+		}}
+		enricher.EnrichOperation(ctx, span, middleware.InitializeInput{Parameters: params}, "SendMessageBatch")
+		require.Contains(t, params.Entries[0].MessageAttributes, datadogKey)
+		require.NotContains(t, params.Entries[1].MessageAttributes, datadogKey)
+	})
 }

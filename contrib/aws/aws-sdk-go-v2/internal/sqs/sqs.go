@@ -8,6 +8,9 @@ package sqs
 import (
 	"context"
 	"encoding/json"
+	"maps"
+	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/DataDog/dd-trace-go/contrib/aws/aws-sdk-go-v2/v2/internal"
@@ -25,6 +28,8 @@ import (
 const (
 	datadogKey           = "_datadog"
 	maxMessageAttributes = 10
+	maxMessageBytes      = 1 << 20
+	maxBatchEntries      = 10
 )
 
 var instr = internal.Instr
@@ -58,7 +63,8 @@ func (e *enricher) handleSendMessage(ctx context.Context, span *tracer.Span, in 
 		return
 	}
 
-	traceContext, err := getTraceContext(ctx, span, queueName(params.QueueUrl), sendMessageSize(params))
+	messageSize := sendMessageSize(params)
+	traceContext, err := getTraceContext(ctx, span, queueName(params.QueueUrl), messageSize)
 	if err != nil {
 		instr.Logger().Debug("Unable to get trace context: %s", err.Error())
 		return
@@ -71,7 +77,7 @@ func (e *enricher) handleSendMessage(ctx context.Context, span *tracer.Span, in 
 		params.MessageAttributes = make(map[string]types.MessageAttributeValue)
 	}
 
-	injectTraceContext(traceContext, params.MessageAttributes)
+	injectTraceContext(traceContext, params.MessageAttributes, maxMessageBytes-messageSize)
 }
 
 func (e *enricher) handleSendMessageBatch(ctx context.Context, span *tracer.Span, in middleware.InitializeInput) {
@@ -81,19 +87,39 @@ func (e *enricher) handleSendMessageBatch(ctx context.Context, span *tracer.Span
 		return
 	}
 
+	remaining := int64(maxMessageBytes)
+	canInject := !e.noInject && len(params.Entries) <= maxBatchEntries
+	if canInject {
+		seen := make([]uintptr, 0, maxBatchEntries)
+		for i := range params.Entries {
+			entry := &params.Entries[i]
+			remaining -= sendMessageBatchEntrySize(entry)
+			if entry.MessageAttributes == nil {
+				continue
+			}
+			// Separate shared maps before injection can change more than one entry.
+			id := reflect.ValueOf(entry.MessageAttributes).Pointer()
+			if slices.Contains(seen, id) {
+				entry.MessageAttributes = maps.Clone(entry.MessageAttributes)
+			} else {
+				seen = append(seen, id)
+			}
+		}
+	}
+
 	for i := range params.Entries {
 		traceContext, err := getTraceContext(ctx, span, queueName(params.QueueUrl), sendMessageBatchEntrySize(&params.Entries[i]))
 		if err != nil {
 			instr.Logger().Debug("Unable to get trace context: %s", err.Error())
 			continue
 		}
-		if e.noInject {
+		if !canInject {
 			continue
 		}
 		if params.Entries[i].MessageAttributes == nil {
 			params.Entries[i].MessageAttributes = make(map[string]types.MessageAttributeValue)
 		}
-		injectTraceContext(traceContext, params.Entries[i].MessageAttributes)
+		remaining -= injectTraceContext(traceContext, params.Entries[i].MessageAttributes, remaining)
 	}
 }
 
@@ -128,16 +154,24 @@ func getTraceContext(ctx context.Context, span *tracer.Span, queue string, paylo
 	return attribute, nil
 }
 
-func injectTraceContext(traceContext types.MessageAttributeValue, messageAttributes map[string]types.MessageAttributeValue) {
+func injectTraceContext(traceContext types.MessageAttributeValue, messageAttributes map[string]types.MessageAttributeValue, remaining int64) int64 {
 	// SQS only allows a maximum of 10 message attributes.
 	// https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html#sqs-message-attributes
 	// Only inject if there's room.
 	if len(messageAttributes) >= maxMessageAttributes {
 		instr.Logger().Info("Cannot inject trace context: message already has maximum allowed attributes")
-		return
+		return 0
 	}
 
+	added := attributeSize(datadogKey, traceContext)
+	if old, ok := messageAttributes[datadogKey]; ok {
+		added -= attributeSize(datadogKey, old)
+	}
+	if added > remaining {
+		return 0
+	}
 	messageAttributes[datadogKey] = traceContext
+	return added
 }
 
 func queueName(queueURL *string) string {
@@ -175,14 +209,13 @@ func sendMessageBatchEntrySize(entry *types.SendMessageBatchRequestEntry) int64 
 func messageAttributesSize(attrs map[string]types.MessageAttributeValue) int64 {
 	var size int64
 	for name, attr := range attrs {
-		size += int64(len(name))
-		if attr.DataType != nil {
-			size += int64(len(*attr.DataType))
-		}
-		if attr.StringValue != nil {
-			size += int64(len(*attr.StringValue))
-		}
-		size += int64(len(attr.BinaryValue))
+		size += attributeSize(name, attr)
 	}
 	return size
+}
+
+func attributeSize(name string, attr types.MessageAttributeValue) int64 {
+	metadata := len(name) + len(aws.ToString(attr.DataType))
+	value := len(aws.ToString(attr.StringValue)) + len(attr.BinaryValue)
+	return int64(metadata + value)
 }
